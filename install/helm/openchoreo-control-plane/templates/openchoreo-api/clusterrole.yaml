@@ -40,6 +40,8 @@ rules:
   - webapplicationbindings
   - webapplicationclasses
   - webapplications
+  - workflows
+  - workflowruns
   - workloads
   verbs:
   - create
