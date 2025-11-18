@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"golang.org/x/exp/slog"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,6 +17,7 @@ import (
 
 	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
 	"github.com/openchoreo/openchoreo/internal/controller"
+	"github.com/openchoreo/openchoreo/internal/labels"
 	"github.com/openchoreo/openchoreo/internal/openchoreo-api/models"
 )
 
@@ -49,6 +51,720 @@ func NewComponentService(k8sClient client.Client, projectService *ProjectService
 		specFetcherRegistry: NewComponentSpecFetcherRegistry(),
 		logger:              logger,
 	}
+}
+
+func (s *ComponentService) CreateComponentRelease(ctx context.Context, orgName, projectName, componentName, releaseName string) (*models.ComponentReleaseResponse, error) {
+	s.logger.Debug("Creating component release", "org", orgName, "project", projectName, "component", componentName, "release", releaseName)
+
+	_, err := s.projectService.GetProject(ctx, orgName, projectName)
+	if err != nil {
+		if errors.Is(err, ErrProjectNotFound) {
+			s.logger.Warn("Project not found", "org", orgName, "project", projectName)
+			return nil, ErrProjectNotFound
+		}
+		return nil, fmt.Errorf("failed to verify project: %w", err)
+	}
+
+	componentKey := client.ObjectKey{
+		Name:      componentName,
+		Namespace: orgName,
+	}
+	component := &openchoreov1alpha1.Component{}
+	if err := s.k8sClient.Get(ctx, componentKey, component); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Component not found", "org", orgName, "project", projectName, "component", componentName)
+			return nil, ErrComponentNotFound
+		}
+		s.logger.Error("Failed to get component", "error", err)
+		return nil, fmt.Errorf("failed to get component: %w", err)
+	}
+
+	// Verify component belongs to the project
+	if component.Spec.Owner.ProjectName != projectName {
+		s.logger.Warn("Component belongs to different project", "org", orgName, "expected_project", projectName, "actual_project", component.Spec.Owner.ProjectName)
+		return nil, ErrComponentNotFound
+	}
+
+	listOpts := []client.ListOption{
+		client.InNamespace(orgName),
+	}
+	workloadList := &openchoreov1alpha1.WorkloadList{}
+	if err := s.k8sClient.List(ctx, workloadList, listOpts...); err != nil {
+		s.logger.Error("Failed to list workloads", "error", err)
+		return nil, fmt.Errorf("failed to list workloads: %w", err)
+	}
+
+	var workload *openchoreov1alpha1.Workload
+	for _, item := range workloadList.Items {
+		if item.Spec.Owner.ComponentName == componentName && item.Spec.Owner.ProjectName == projectName {
+			workload = &item
+			break
+		}
+	}
+
+	if workload == nil {
+		s.logger.Warn("Workload not found", "org", orgName, "project", projectName, "component", componentName)
+		return nil, ErrWorkloadNotFound
+	}
+
+	// Generate release name if not provided
+	if releaseName == "" {
+		generatedName, err := s.generateReleaseName(ctx, orgName, projectName, componentName)
+		if err != nil {
+			return nil, err
+		}
+		releaseName = generatedName
+	}
+
+	// Get ComponentType if using new model
+	var componentTypeSpec *openchoreov1alpha1.ComponentTypeSpec
+	if component.Spec.ComponentType != "" {
+		// Fetch ComponentType CR
+		// ComponentType format: {workloadType}/{componentTypeName}
+		// Extract the part after '/' for the ComponentType resource name
+		parts := strings.Split(component.Spec.ComponentType, "/")
+		if len(parts) != 2 {
+			s.logger.Error("Invalid ComponentType format", "componentType", component.Spec.ComponentType)
+			return nil, fmt.Errorf("invalid componentType format: %s", component.Spec.ComponentType)
+		}
+		componentTypeName := parts[1]
+		componentTypeKey := client.ObjectKey{
+			Name:      componentTypeName,
+			Namespace: orgName,
+		}
+		componentType := &openchoreov1alpha1.ComponentType{}
+		if err := s.k8sClient.Get(ctx, componentTypeKey, componentType); err != nil {
+			if client.IgnoreNotFound(err) == nil {
+				s.logger.Warn("ComponentType not found", "componentType", component.Spec.ComponentType)
+			} else {
+				s.logger.Error("Failed to get ComponentType", "error", err)
+			}
+		} else {
+			componentTypeSpec = &componentType.Spec
+		}
+	}
+
+	traits := make(map[string]openchoreov1alpha1.TraitSpec)
+	for _, componentTrait := range component.Spec.Traits {
+		traitKey := client.ObjectKey{
+			Name:      componentTrait.Name,
+			Namespace: orgName,
+		}
+		trait := &openchoreov1alpha1.Trait{}
+		if err := s.k8sClient.Get(ctx, traitKey, trait); err != nil {
+			if client.IgnoreNotFound(err) == nil {
+				s.logger.Warn("Trait not found", "trait", componentTrait.Name)
+			} else {
+				s.logger.Error("Failed to get Trait", "error", err)
+			}
+			continue
+		}
+		traits[componentTrait.InstanceName] = trait.Spec
+	}
+
+	// Build ComponentProfile from Component parameters
+	componentProfile := openchoreov1alpha1.ComponentProfile{}
+	if component.Spec.Parameters != nil {
+		componentProfile.Parameters = component.Spec.Parameters
+	}
+
+	// Build workload template spec from workload spec
+	workloadTemplateSpec := openchoreov1alpha1.WorkloadTemplateSpec{
+		Containers: workload.Spec.Containers,
+		Endpoints:  workload.Spec.Endpoints,
+	}
+
+	componentRelease := &openchoreov1alpha1.ComponentRelease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      releaseName,
+			Namespace: orgName,
+			Labels: map[string]string{
+				labels.LabelKeyProjectName:   projectName,
+				labels.LabelKeyComponentName: componentName,
+			},
+		},
+		Spec: openchoreov1alpha1.ComponentReleaseSpec{
+			Owner: openchoreov1alpha1.ComponentReleaseOwner{
+				ProjectName:   projectName,
+				ComponentName: componentName,
+			},
+			ComponentProfile: componentProfile,
+			Workload:         workloadTemplateSpec,
+		},
+	}
+
+	if componentTypeSpec != nil {
+		componentRelease.Spec.ComponentType = *componentTypeSpec
+	}
+
+	if len(traits) > 0 {
+		componentRelease.Spec.Traits = traits
+	}
+
+	if err := s.k8sClient.Create(ctx, componentRelease); err != nil {
+		s.logger.Error("Failed to create ComponentRelease CR", "error", err)
+		return nil, fmt.Errorf("failed to create component release: %w", err)
+	}
+
+	s.logger.Debug("ComponentRelease created successfully", "org", orgName, "project", projectName, "component", componentName, "release", releaseName)
+	return &models.ComponentReleaseResponse{
+		Name:          releaseName,
+		ComponentName: componentName,
+		ProjectName:   projectName,
+		OrgName:       orgName,
+		CreatedAt:     componentRelease.CreationTimestamp.Time,
+		Status:        statusReady,
+	}, nil
+}
+
+// generateReleaseName generates a unique release name for a component
+// Format: <component_name>-<date>-<number>
+// Example: my-component-20240118-1
+func (s *ComponentService) generateReleaseName(ctx context.Context, orgName, projectName, componentName string) (string, error) {
+	// List existing releases for this component
+	releaseList := &openchoreov1alpha1.ComponentReleaseList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(orgName),
+		client.MatchingLabels{
+			labels.LabelKeyProjectName:   projectName,
+			labels.LabelKeyComponentName: componentName,
+		},
+	}
+	if err := s.k8sClient.List(ctx, releaseList, listOpts...); err != nil {
+		s.logger.Error("Failed to list existing releases", "error", err)
+		return "", fmt.Errorf("failed to list releases: %w", err)
+	}
+
+	// Generate date string in YYYYMMDD format
+	now := metav1.Now()
+	dateStr := now.Format("20060102")
+
+	// Count releases created today with the same prefix
+	todayPrefix := fmt.Sprintf("%s-%s-", componentName, dateStr)
+	todayCount := 0
+	for _, release := range releaseList.Items {
+		if len(release.Name) >= len(todayPrefix) && release.Name[:len(todayPrefix)] == todayPrefix {
+			todayCount++
+		}
+	}
+
+	// Generate the release name with incremented count
+	releaseName := fmt.Sprintf("%s-%s-%d", componentName, dateStr, todayCount+1)
+	return releaseName, nil
+}
+
+// ListComponentReleases lists all component releases for a specific component
+func (s *ComponentService) ListComponentReleases(ctx context.Context, orgName, projectName, componentName string) ([]*models.ComponentReleaseResponse, error) {
+	s.logger.Debug("Listing component releases", "org", orgName, "project", projectName, "component", componentName)
+
+	_, err := s.projectService.GetProject(ctx, orgName, projectName)
+	if err != nil {
+		if errors.Is(err, ErrProjectNotFound) {
+			return nil, ErrProjectNotFound
+		}
+		return nil, fmt.Errorf("failed to verify project: %w", err)
+	}
+
+	componentKey := client.ObjectKey{
+		Namespace: orgName,
+		Name:      componentName,
+	}
+	var component openchoreov1alpha1.Component
+	if err := s.k8sClient.Get(ctx, componentKey, &component); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Component not found", "org", orgName, "project", projectName, "component", componentName)
+			return nil, ErrComponentNotFound
+		}
+		s.logger.Error("Failed to get component", "error", err)
+		return nil, fmt.Errorf("failed to get component: %w", err)
+	}
+
+	if component.Spec.Owner.ProjectName != projectName {
+		s.logger.Warn("Component does not belong to project", "org", orgName, "project", projectName, "component", componentName)
+		return nil, ErrComponentNotFound
+	}
+
+	var releaseList openchoreov1alpha1.ComponentReleaseList
+	listOpts := []client.ListOption{
+		client.InNamespace(orgName),
+		client.MatchingLabels{
+			labels.LabelKeyProjectName:   projectName,
+			labels.LabelKeyComponentName: componentName,
+		},
+	}
+
+	if err := s.k8sClient.List(ctx, &releaseList, listOpts...); err != nil {
+		s.logger.Error("Failed to list component releases", "error", err)
+		return nil, fmt.Errorf("failed to list component releases: %w", err)
+	}
+
+	releases := make([]*models.ComponentReleaseResponse, 0, len(releaseList.Items))
+	for _, item := range releaseList.Items {
+		releases = append(releases, &models.ComponentReleaseResponse{
+			Name:          item.Name,
+			ComponentName: componentName,
+			ProjectName:   projectName,
+			OrgName:       orgName,
+			CreatedAt:     item.CreationTimestamp.Time,
+			Status:        statusReady, // ComponentRelease is immutable, so it's always ready once created
+		})
+	}
+
+	s.logger.Debug("Listed component releases", "org", orgName, "project", projectName, "component", componentName, "count", len(releases))
+	return releases, nil
+}
+
+// GetComponentRelease retrieves a specific component release by its name
+func (s *ComponentService) GetComponentRelease(ctx context.Context, orgName, projectName, componentName, releaseName string) (*models.ComponentReleaseResponse, error) {
+	s.logger.Debug("Getting component release", "org", orgName, "project", projectName, "component", componentName, "release", releaseName)
+
+	_, err := s.projectService.GetProject(ctx, orgName, projectName)
+	if err != nil {
+		if errors.Is(err, ErrProjectNotFound) {
+			return nil, ErrProjectNotFound
+		}
+		return nil, fmt.Errorf("failed to verify project: %w", err)
+	}
+
+	componentKey := client.ObjectKey{
+		Namespace: orgName,
+		Name:      componentName,
+	}
+	var component openchoreov1alpha1.Component
+	if err := s.k8sClient.Get(ctx, componentKey, &component); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Component not found", "org", orgName, "project", projectName, "component", componentName)
+			return nil, ErrComponentNotFound
+		}
+		s.logger.Error("Failed to get component", "error", err)
+		return nil, fmt.Errorf("failed to get component: %w", err)
+	}
+
+	if component.Spec.Owner.ProjectName != projectName {
+		s.logger.Warn("Component does not belong to project", "org", orgName, "project", projectName, "component", componentName)
+		return nil, ErrComponentNotFound
+	}
+
+	releaseKey := client.ObjectKey{
+		Namespace: orgName,
+		Name:      releaseName,
+	}
+	var release openchoreov1alpha1.ComponentRelease
+	if err := s.k8sClient.Get(ctx, releaseKey, &release); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Component release not found", "org", orgName, "project", projectName, "component", componentName, "release", releaseName)
+			return nil, ErrComponentReleaseNotFound
+		}
+		s.logger.Error("Failed to get component release", "error", err)
+		return nil, fmt.Errorf("failed to get component release: %w", err)
+	}
+
+	if release.Spec.Owner.ComponentName != componentName {
+		s.logger.Warn("Component release does not belong to component", "org", orgName, "component", componentName, "release", releaseName)
+		return nil, ErrComponentReleaseNotFound
+	}
+
+	s.logger.Debug("Retrieved component release", "org", orgName, "project", projectName, "component", componentName, "release", releaseName)
+	return &models.ComponentReleaseResponse{
+		Name:          release.Name,
+		ComponentName: componentName,
+		ProjectName:   projectName,
+		OrgName:       orgName,
+		CreatedAt:     release.CreationTimestamp.Time,
+		Status:        statusReady, // ComponentRelease is immutable, so it's always ready once created
+	}, nil
+}
+
+// PatchReleaseBinding patches a ReleaseBinding with environment-specific overrides
+func (s *ComponentService) PatchReleaseBinding(ctx context.Context, orgName, projectName, componentName, bindingName string, req *models.PatchReleaseBindingRequest) (*models.ReleaseBindingResponse, error) {
+	s.logger.Debug("Patching release binding", "org", orgName, "project", projectName, "component", componentName, "binding", bindingName)
+
+	_, err := s.projectService.GetProject(ctx, orgName, projectName)
+	if err != nil {
+		if errors.Is(err, ErrProjectNotFound) {
+			return nil, ErrProjectNotFound
+		}
+		return nil, fmt.Errorf("failed to verify project: %w", err)
+	}
+
+	componentKey := client.ObjectKey{
+		Namespace: orgName,
+		Name:      componentName,
+	}
+	var component openchoreov1alpha1.Component
+	if err := s.k8sClient.Get(ctx, componentKey, &component); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Component not found", "org", orgName, "project", projectName, "component", componentName)
+			return nil, ErrComponentNotFound
+		}
+		s.logger.Error("Failed to get component", "error", err)
+		return nil, fmt.Errorf("failed to get component: %w", err)
+	}
+
+	if component.Spec.Owner.ProjectName != projectName {
+		s.logger.Warn("Component does not belong to project", "org", orgName, "project", projectName, "component", componentName)
+		return nil, ErrComponentNotFound
+	}
+
+	bindingKey := client.ObjectKey{
+		Namespace: orgName,
+		Name:      bindingName,
+	}
+	var binding openchoreov1alpha1.ReleaseBinding
+	if err := s.k8sClient.Get(ctx, bindingKey, &binding); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Release binding not found", "org", orgName, "binding", bindingName)
+			return nil, ErrReleaseBindingNotFound
+		}
+		s.logger.Error("Failed to get release binding", "error", err)
+		return nil, fmt.Errorf("failed to get release binding: %w", err)
+	}
+
+	if binding.Spec.Owner.ComponentName != componentName {
+		s.logger.Warn("Release binding does not belong to component", "org", orgName, "component", componentName, "binding", bindingName)
+		return nil, ErrReleaseBindingNotFound
+	}
+
+	if req.ComponentTypeEnvOverrides != nil {
+		overridesJSON, err := json.Marshal(req.ComponentTypeEnvOverrides)
+		if err != nil {
+			s.logger.Error("Failed to marshal component type env overrides", "error", err)
+			return nil, fmt.Errorf("failed to marshal component type env overrides: %w", err)
+		}
+		binding.Spec.ComponentTypeEnvOverrides = &runtime.RawExtension{Raw: overridesJSON}
+	}
+
+	if req.TraitOverrides != nil {
+		binding.Spec.TraitOverrides = make(map[string]runtime.RawExtension)
+		for instanceName, overrides := range req.TraitOverrides {
+			overridesJSON, err := json.Marshal(overrides)
+			if err != nil {
+				s.logger.Error("Failed to marshal trait overrides", "error", err, "instanceName", instanceName)
+				return nil, fmt.Errorf("failed to marshal trait overrides for %s: %w", instanceName, err)
+			}
+			binding.Spec.TraitOverrides[instanceName] = runtime.RawExtension{Raw: overridesJSON}
+		}
+	}
+
+	if req.ConfigurationOverrides != nil {
+		envVars := make([]openchoreov1alpha1.EnvVar, len(req.ConfigurationOverrides.Env))
+		for i, env := range req.ConfigurationOverrides.Env {
+			envVars[i] = openchoreov1alpha1.EnvVar{
+				Key:   env.Key,
+				Value: env.Value,
+			}
+		}
+
+		fileVars := make([]openchoreov1alpha1.FileVar, len(req.ConfigurationOverrides.Files))
+		for i, file := range req.ConfigurationOverrides.Files {
+			fileVars[i] = openchoreov1alpha1.FileVar{
+				Key:       file.Key,
+				MountPath: file.MountPath,
+				Value:     file.Value,
+			}
+		}
+
+		binding.Spec.ConfigurationOverrides = &openchoreov1alpha1.EnvConfigurationOverrides{
+			Env:   envVars,
+			Files: fileVars,
+		}
+	}
+
+	if err := s.k8sClient.Update(ctx, &binding); err != nil {
+		s.logger.Error("Failed to update release binding", "error", err)
+		return nil, fmt.Errorf("failed to update release binding: %w", err)
+	}
+
+	s.logger.Debug("Release binding patched successfully", "org", orgName, "project", projectName, "component", componentName, "binding", bindingName)
+
+	return s.toReleaseBindingResponse(&binding, orgName, projectName, componentName), nil
+}
+
+// toReleaseBindingResponse converts a ReleaseBinding CR to a ReleaseBindingResponse
+func (s *ComponentService) toReleaseBindingResponse(binding *openchoreov1alpha1.ReleaseBinding, orgName, projectName, componentName string) *models.ReleaseBindingResponse {
+	response := &models.ReleaseBindingResponse{
+		Name:          binding.Name,
+		ComponentName: componentName,
+		ProjectName:   projectName,
+		OrgName:       orgName,
+		Environment:   binding.Spec.Environment,
+		ReleaseName:   binding.Spec.ReleaseName,
+		CreatedAt:     binding.CreationTimestamp.Time,
+		Status:        statusNotReady,
+	}
+
+	if binding.Spec.ComponentTypeEnvOverrides != nil {
+		var overrides map[string]interface{}
+		if err := json.Unmarshal(binding.Spec.ComponentTypeEnvOverrides.Raw, &overrides); err == nil {
+			response.ComponentTypeEnvOverrides = overrides
+		}
+	}
+
+	if len(binding.Spec.TraitOverrides) > 0 {
+		response.TraitOverrides = make(map[string]interface{})
+		for instanceName, rawExt := range binding.Spec.TraitOverrides {
+			var overrides map[string]interface{}
+			if err := json.Unmarshal(rawExt.Raw, &overrides); err == nil {
+				response.TraitOverrides[instanceName] = overrides
+			}
+		}
+	}
+
+	if binding.Spec.ConfigurationOverrides != nil {
+		envVars := make([]models.EnvVar, len(binding.Spec.ConfigurationOverrides.Env))
+		for i, env := range binding.Spec.ConfigurationOverrides.Env {
+			envVars[i] = models.EnvVar{
+				Key:   env.Key,
+				Value: env.Value,
+			}
+		}
+
+		fileVars := make([]models.FileVar, len(binding.Spec.ConfigurationOverrides.Files))
+		for i, file := range binding.Spec.ConfigurationOverrides.Files {
+			fileVars[i] = models.FileVar{
+				Key:       file.Key,
+				MountPath: file.MountPath,
+				Value:     file.Value,
+			}
+		}
+
+		response.ConfigurationOverrides = &models.ConfigurationOverrides{
+			Env:   envVars,
+			Files: fileVars,
+		}
+	}
+
+	return response
+}
+
+// ListReleaseBindings lists all release bindings for a specific component
+// If environments is provided, only returns bindings for those environments
+func (s *ComponentService) ListReleaseBindings(ctx context.Context, orgName, projectName, componentName string, environments []string) ([]*models.ReleaseBindingResponse, error) {
+	s.logger.Debug("Listing release bindings", "org", orgName, "project", projectName, "component", componentName, "environments", environments)
+
+	_, err := s.projectService.GetProject(ctx, orgName, projectName)
+	if err != nil {
+		if errors.Is(err, ErrProjectNotFound) {
+			return nil, ErrProjectNotFound
+		}
+		return nil, fmt.Errorf("failed to verify project: %w", err)
+	}
+
+	componentKey := client.ObjectKey{
+		Namespace: orgName,
+		Name:      componentName,
+	}
+	var component openchoreov1alpha1.Component
+	if err := s.k8sClient.Get(ctx, componentKey, &component); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Component not found", "org", orgName, "project", projectName, "component", componentName)
+			return nil, ErrComponentNotFound
+		}
+		s.logger.Error("Failed to get component", "error", err)
+		return nil, fmt.Errorf("failed to get component: %w", err)
+	}
+
+	if component.Spec.Owner.ProjectName != projectName {
+		s.logger.Warn("Component does not belong to project", "org", orgName, "project", projectName, "component", componentName)
+		return nil, ErrComponentNotFound
+	}
+
+	var bindingList openchoreov1alpha1.ReleaseBindingList
+	listOpts := []client.ListOption{
+		client.InNamespace(orgName),
+		client.MatchingLabels{
+			labels.LabelKeyProjectName:   projectName,
+			labels.LabelKeyComponentName: componentName,
+		},
+	}
+
+	if err := s.k8sClient.List(ctx, &bindingList, listOpts...); err != nil {
+		s.logger.Error("Failed to list release bindings", "error", err)
+		return nil, fmt.Errorf("failed to list release bindings: %w", err)
+	}
+
+	bindings := make([]*models.ReleaseBindingResponse, 0, len(bindingList.Items))
+	for i := range bindingList.Items {
+		binding := &bindingList.Items[i]
+
+		if len(environments) > 0 {
+			matchesEnv := false
+			for _, env := range environments {
+				if binding.Spec.Environment == env {
+					matchesEnv = true
+					break
+				}
+			}
+			if !matchesEnv {
+				continue
+			}
+		}
+
+		bindings = append(bindings, s.toReleaseBindingResponse(binding, orgName, projectName, componentName))
+	}
+
+	s.logger.Debug("Listed release bindings", "org", orgName, "project", projectName, "component", componentName, "count", len(bindings))
+	return bindings, nil
+}
+
+// DeployRelease deploys a component release to the lowest environment in the deployment pipeline
+func (s *ComponentService) DeployRelease(ctx context.Context, orgName, projectName, componentName string, req *models.DeployReleaseRequest) (*models.ReleaseBindingResponse, error) {
+	s.logger.Debug("Deploying release", "org", orgName, "project", projectName, "component", componentName, "release", req.ReleaseName)
+
+	project, err := s.projectService.GetProject(ctx, orgName, projectName)
+	if err != nil {
+		if errors.Is(err, ErrProjectNotFound) {
+			return nil, ErrProjectNotFound
+		}
+		return nil, fmt.Errorf("failed to verify project: %w", err)
+	}
+
+	pipelineName := project.DeploymentPipeline
+	if pipelineName == "" {
+		s.logger.Warn("Project has no deployment pipeline", "org", orgName, "project", projectName)
+		return nil, fmt.Errorf("project has no deployment pipeline configured")
+	}
+
+	pipelineKey := client.ObjectKey{
+		Namespace: orgName,
+		Name:      pipelineName,
+	}
+	var pipeline openchoreov1alpha1.DeploymentPipeline
+	if err := s.k8sClient.Get(ctx, pipelineKey, &pipeline); err != nil {
+		s.logger.Error("Failed to get deployment pipeline", "error", err, "pipeline", pipelineName)
+		return nil, fmt.Errorf("failed to get deployment pipeline: %w", err)
+	}
+
+	// Find the lowest environment (source environment with no incoming paths)
+	lowestEnv := s.findLowestEnvironment(pipeline.Spec.PromotionPaths)
+	if lowestEnv == "" {
+		s.logger.Warn("No lowest environment found in deployment pipeline", "pipeline", pipelineName)
+		return nil, fmt.Errorf("no lowest environment found in deployment pipeline")
+	}
+
+	s.logger.Debug("Found lowest environment", "environment", lowestEnv)
+
+	// Verify component exists
+	componentKey := client.ObjectKey{
+		Namespace: orgName,
+		Name:      componentName,
+	}
+	var component openchoreov1alpha1.Component
+	if err := s.k8sClient.Get(ctx, componentKey, &component); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Component not found", "org", orgName, "project", projectName, "component", componentName)
+			return nil, ErrComponentNotFound
+		}
+		s.logger.Error("Failed to get component", "error", err)
+		return nil, fmt.Errorf("failed to get component: %w", err)
+	}
+
+	if component.Spec.Owner.ProjectName != projectName {
+		s.logger.Warn("Component does not belong to project", "org", orgName, "project", projectName, "component", componentName)
+		return nil, ErrComponentNotFound
+	}
+
+	releaseKey := client.ObjectKey{
+		Namespace: orgName,
+		Name:      req.ReleaseName,
+	}
+	var release openchoreov1alpha1.ComponentRelease
+	if err := s.k8sClient.Get(ctx, releaseKey, &release); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			s.logger.Warn("Component release not found", "org", orgName, "release", req.ReleaseName)
+			return nil, ErrComponentReleaseNotFound
+		}
+		s.logger.Error("Failed to get component release", "error", err)
+		return nil, fmt.Errorf("failed to get component release: %w", err)
+	}
+
+	if release.Spec.Owner.ComponentName != componentName {
+		s.logger.Warn("Release does not belong to component", "component", componentName, "release", req.ReleaseName)
+		return nil, ErrComponentReleaseNotFound
+	}
+
+	bindingName := fmt.Sprintf("%s-%s", componentName, lowestEnv)
+	bindingKey := client.ObjectKey{
+		Namespace: orgName,
+		Name:      bindingName,
+	}
+
+	var binding openchoreov1alpha1.ReleaseBinding
+	bindingExists := true
+	if err := s.k8sClient.Get(ctx, bindingKey, &binding); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			bindingExists = false
+		} else {
+			s.logger.Error("Failed to get release binding", "error", err)
+			return nil, fmt.Errorf("failed to get release binding: %w", err)
+		}
+	}
+
+	if bindingExists {
+		s.logger.Debug("Updating existing release binding", "binding", bindingName)
+		binding.Spec.ReleaseName = req.ReleaseName
+		if err := s.k8sClient.Update(ctx, &binding); err != nil {
+			s.logger.Error("Failed to update release binding", "error", err)
+			return nil, fmt.Errorf("failed to update release binding: %w", err)
+		}
+	} else {
+		s.logger.Debug("Creating new release binding", "binding", bindingName)
+		binding = openchoreov1alpha1.ReleaseBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      bindingName,
+				Namespace: orgName,
+				Labels: map[string]string{
+					labels.LabelKeyProjectName:   projectName,
+					labels.LabelKeyComponentName: componentName,
+				},
+			},
+			Spec: openchoreov1alpha1.ReleaseBindingSpec{
+				Owner: openchoreov1alpha1.ReleaseBindingOwner{
+					ProjectName:   projectName,
+					ComponentName: componentName,
+				},
+				Environment: lowestEnv,
+				ReleaseName: req.ReleaseName,
+			},
+		}
+		if err := s.k8sClient.Create(ctx, &binding); err != nil {
+			s.logger.Error("Failed to create release binding", "error", err)
+			return nil, fmt.Errorf("failed to create release binding: %w", err)
+		}
+	}
+
+	s.logger.Debug("Release deployed successfully", "org", orgName, "project", projectName, "component", componentName, "release", req.ReleaseName, "environment", lowestEnv)
+	return s.toReleaseBindingResponse(&binding, orgName, projectName, componentName), nil
+}
+
+// findLowestEnvironment finds the lowest environment in the deployment pipeline
+// The lowest environment is one that is not a target in any promotion path
+func (s *ComponentService) findLowestEnvironment(promotionPaths []openchoreov1alpha1.PromotionPath) string {
+	if len(promotionPaths) == 0 {
+		return ""
+	}
+
+	// Collect all target environments
+	targets := make(map[string]bool)
+	for _, path := range promotionPaths {
+		for _, target := range path.TargetEnvironmentRefs {
+			targets[target.Name] = true
+		}
+	}
+
+	// Find a source environment that is not a target
+	for _, path := range promotionPaths {
+		if !targets[path.SourceEnvironmentRef] {
+			return path.SourceEnvironmentRef
+		}
+	}
+
+	// If all sources are targets (circular), return the first source
+	if len(promotionPaths) > 0 {
+		return promotionPaths[0].SourceEnvironmentRef
+	}
+
+	return ""
 }
 
 // CreateComponent creates a new component in the given project
@@ -373,6 +1089,8 @@ func (s *ComponentService) GetComponentBindings(ctx context.Context, orgName, pr
 		bindings = append(bindings, binding)
 	}
 
+	s.logger.Info("Bindings", "bindings", bindings)
+
 	return bindings, nil
 }
 
@@ -416,6 +1134,144 @@ func (s *ComponentService) getComponentBinding(ctx context.Context, orgName, pro
 	bindingResponse.Environment = environment
 
 	return bindingResponse, nil
+}
+
+// getServiceBindingByName retrieves a ServiceBinding from the cluster by its CR name
+func (s *ComponentService) getServiceBindingByName(ctx context.Context, orgName, bindingName string) (*models.BindingResponse, error) {
+	binding := &openchoreov1alpha1.ServiceBinding{}
+	err := s.k8sClient.Get(ctx, client.ObjectKey{
+		Name:      bindingName,
+		Namespace: orgName,
+	}, binding)
+	if err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			s.logger.Error("Failed to get service binding by name", "error", err, "binding", bindingName)
+			return nil, fmt.Errorf("failed to get service binding: %w", err)
+		}
+		s.logger.Warn("Service binding not found", "binding", bindingName)
+		return nil, ErrBindingNotFound
+	}
+
+	// Convert to response model
+	response := &models.BindingResponse{
+		Name:        binding.Name,
+		Type:        "Service",
+		Environment: binding.Spec.Environment,
+		BindingStatus: models.BindingStatus{
+			Status:  models.BindingStatusTypeUndeployed, // Default to "NotYetDeployed"
+			Reason:  "",
+			Message: "",
+		},
+	}
+
+	// Extract status from conditions
+	for _, condition := range binding.Status.Conditions {
+		if condition.Type == statusReady {
+			response.BindingStatus.Reason = condition.Reason
+			response.BindingStatus.Message = condition.Message
+			response.BindingStatus.LastTransitioned = condition.LastTransitionTime.Time
+			response.BindingStatus.Status = s.mapConditionToBindingStatus(condition)
+			break
+		}
+	}
+
+	// Convert endpoint status and extract image
+	serviceBinding := &models.ServiceBinding{
+		Endpoints:    s.convertEndpointStatus(binding.Status.Endpoints),
+		Image:        s.extractImageFromWorkloadSpec(binding.Spec.WorkloadSpec),
+		ReleaseState: string(binding.Spec.ReleaseState),
+	}
+	response.ServiceBinding = serviceBinding
+
+	return response, nil
+}
+
+// getWebApplicationBindingByName retrieves a WebApplicationBinding from the cluster by its CR name
+func (s *ComponentService) getWebApplicationBindingByName(ctx context.Context, orgName, bindingName string) (*models.BindingResponse, error) {
+	binding := &openchoreov1alpha1.WebApplicationBinding{}
+	err := s.k8sClient.Get(ctx, client.ObjectKey{
+		Name:      bindingName,
+		Namespace: orgName,
+	}, binding)
+	if err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			s.logger.Error("Failed to get web application binding by name", "error", err, "binding", bindingName)
+			return nil, fmt.Errorf("failed to get web application binding: %w", err)
+		}
+		s.logger.Warn("Web application binding not found", "binding", bindingName)
+		return nil, ErrBindingNotFound
+	}
+
+	// Convert to response model
+	response := &models.BindingResponse{
+		Name:        binding.Name,
+		Type:        "WebApplication",
+		Environment: binding.Spec.Environment,
+		BindingStatus: models.BindingStatus{
+			Status:  models.BindingStatusTypeUndeployed,
+			Reason:  "",
+			Message: "",
+		},
+	}
+
+	// Extract status from conditions
+	for _, condition := range binding.Status.Conditions {
+		if condition.Type == statusReady {
+			response.BindingStatus.Reason = condition.Reason
+			response.BindingStatus.Message = condition.Message
+			response.BindingStatus.LastTransitioned = condition.LastTransitionTime.Time
+			response.BindingStatus.Status = s.mapConditionToBindingStatus(condition)
+			break
+		}
+	}
+
+	// Convert endpoint status and extract image
+	webAppBinding := &models.WebApplicationBinding{
+		Endpoints:    s.convertEndpointStatus(binding.Status.Endpoints),
+		Image:        s.extractImageFromWorkloadSpec(binding.Spec.WorkloadSpec),
+		ReleaseState: string(binding.Spec.ReleaseState),
+	}
+	response.WebApplicationBinding = webAppBinding
+
+	return response, nil
+}
+
+// getScheduledTaskBindingByName retrieves a ScheduledTaskBinding from the cluster by its CR name
+func (s *ComponentService) getScheduledTaskBindingByName(ctx context.Context, orgName, bindingName string) (*models.BindingResponse, error) {
+	binding := &openchoreov1alpha1.ScheduledTaskBinding{}
+	err := s.k8sClient.Get(ctx, client.ObjectKey{
+		Name:      bindingName,
+		Namespace: orgName,
+	}, binding)
+	if err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			s.logger.Error("Failed to get scheduled task binding by name", "error", err, "binding", bindingName)
+			return nil, fmt.Errorf("failed to get scheduled task binding: %w", err)
+		}
+		s.logger.Warn("Scheduled task binding not found", "binding", bindingName)
+		return nil, ErrBindingNotFound
+	}
+
+	// Convert to response model
+	response := &models.BindingResponse{
+		Name:        binding.Name,
+		Type:        "ScheduledTask",
+		Environment: binding.Spec.Environment,
+		BindingStatus: models.BindingStatus{
+			Status:  models.BindingStatusTypeReady, // Default to Ready for ScheduledTask
+			Reason:  "",
+			Message: "",
+		},
+	}
+
+	// Extract image from workload spec
+	scheduledTaskBinding := &models.ScheduledTaskBinding{
+		Image:        s.extractImageFromWorkloadSpec(binding.Spec.WorkloadSpec),
+		ReleaseState: string(binding.Spec.ReleaseState),
+	}
+	response.ScheduledTaskBinding = scheduledTaskBinding
+
+	return response, nil
 }
 
 // getServiceBinding retrieves a ServiceBinding from the cluster
@@ -634,42 +1490,30 @@ func (s *ComponentService) getEnvironmentsFromDeploymentPipeline(ctx context.Con
 }
 
 // PromoteComponent promotes a component from source environment to target environment
-func (s *ComponentService) PromoteComponent(ctx context.Context, req *PromoteComponentPayload) ([]*models.BindingResponse, error) {
+func (s *ComponentService) PromoteComponent(ctx context.Context, req *PromoteComponentPayload) (*models.ReleaseBindingResponse, error) {
 	s.logger.Debug("Promoting component", "org", req.OrgName, "project", req.ProjectName, "component", req.ComponentName,
 		"source", req.SourceEnvironment, "target", req.TargetEnvironment)
 
-	// Validate that the promotion path is allowed by the deployment pipeline
 	if err := s.validatePromotionPath(ctx, req.OrgName, req.ProjectName, req.SourceEnvironment, req.TargetEnvironment); err != nil {
 		return nil, err
 	}
 
-	// Get the component to determine its type
-	component, err := s.GetComponent(ctx, req.OrgName, req.ProjectName, req.ComponentName, []string{})
+	sourceReleaseBinding, err := s.getReleaseBinding(ctx, req.OrgName, req.ProjectName, req.ComponentName, req.SourceEnvironment)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get source release binding: %w", err)
 	}
 
-	// Create or update the target binding
-	if err := s.createOrUpdateTargetBinding(ctx, req, component.Type); err != nil {
-		return nil, fmt.Errorf("failed to create target binding: %w", err)
+	if err := s.createOrUpdateReleaseBinding(ctx, req, sourceReleaseBinding); err != nil {
+		return nil, fmt.Errorf("failed to create/update target release binding: %w", err)
 	}
 
-	// Return all bindings for the component after promotion
-	allEnvironments, err := s.getEnvironmentsFromDeploymentPipeline(ctx, req.OrgName, req.ProjectName)
+	targetReleaseBinding, err := s.getReleaseBinding(ctx, req.OrgName, req.ProjectName, req.ComponentName, req.TargetEnvironment)
 	if err != nil {
-		s.logger.Warn("Failed to get environments from deployment pipeline, returning empty list", "error", err)
-		allEnvironments = []string{req.SourceEnvironment, req.TargetEnvironment}
+		return nil, fmt.Errorf("failed to get release binding: %w", err)
 	}
+	s.logger.Info("Release binding", "binding", targetReleaseBinding)
 
-	bindings, err := s.GetComponentBindings(ctx, req.OrgName, req.ProjectName, req.ComponentName, allEnvironments)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get component bindings after promotion: %w", err)
-	}
-
-	s.logger.Debug("Component promoted successfully", "org", req.OrgName, "project", req.ProjectName, "component", req.ComponentName,
-		"source", req.SourceEnvironment, "target", req.TargetEnvironment, "bindingsCount", len(bindings))
-
-	return bindings, nil
+	return s.toReleaseBindingResponse(targetReleaseBinding, req.OrgName, req.ProjectName, req.ComponentName), nil
 }
 
 // extractImageFromWorkloadSpec extracts the first container image from the workload spec
@@ -742,11 +1586,16 @@ func (s *ComponentService) validatePromotionPath(ctx context.Context, orgName, p
 		return fmt.Errorf("failed to get deployment pipeline: %w", err)
 	}
 
+	s.logger.Info("Promotion paths", "promotionPaths", pipeline.Spec.PromotionPaths)
+
 	// Check if the promotion path is valid
 	for _, path := range pipeline.Spec.PromotionPaths {
 		if path.SourceEnvironmentRef == sourceEnv {
+			s.logger.Info("Source environment", "source", sourceEnv)
 			for _, target := range path.TargetEnvironmentRefs {
+				s.logger.Info("Target environment", "target", target.Name)
 				if target.Name == targetEnv {
+					s.logger.Info("Valid promotion path found", "source", sourceEnv, "target", targetEnv)
 					s.logger.Debug("Valid promotion path found", "source", sourceEnv, "target", targetEnv)
 					return nil
 				}
@@ -756,6 +1605,95 @@ func (s *ComponentService) validatePromotionPath(ctx context.Context, orgName, p
 
 	s.logger.Warn("Invalid promotion path", "source", sourceEnv, "target", targetEnv, "pipeline", pipelineName)
 	return ErrInvalidPromotionPath
+}
+
+// getReleaseBinding retrieves a ReleaseBinding for a component in a specific environment
+func (s *ComponentService) getReleaseBinding(ctx context.Context, orgName, projectName, componentName, environment string) (*openchoreov1alpha1.ReleaseBinding, error) {
+	// List all ReleaseBindings in the namespace
+	bindingList := &openchoreov1alpha1.ReleaseBindingList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(orgName),
+		client.MatchingLabels{
+			labels.LabelKeyProjectName:   projectName,
+			labels.LabelKeyComponentName: componentName,
+		},
+	}
+
+	if err := s.k8sClient.List(ctx, bindingList, listOpts...); err != nil {
+		return nil, fmt.Errorf("failed to list release bindings: %w", err)
+	}
+
+	// Find the binding that matches the environment
+	for i := range bindingList.Items {
+		binding := &bindingList.Items[i]
+		if binding.Spec.Environment == environment {
+			return binding, nil
+		}
+	}
+
+	return nil, ErrReleaseBindingNotFound
+}
+
+// createOrUpdateReleaseBinding creates or updates a ReleaseBinding in the target environment
+func (s *ComponentService) createOrUpdateReleaseBinding(ctx context.Context, req *PromoteComponentPayload, sourceBinding *openchoreov1alpha1.ReleaseBinding) error {
+	// Check if there's already a binding for this component in the target environment
+	existingTargetBinding, err := s.getReleaseBinding(ctx, req.OrgName, req.ProjectName, req.ComponentName, req.TargetEnvironment)
+	var targetBindingName string
+
+	if err != nil && !errors.Is(err, ErrReleaseBindingNotFound) {
+		return fmt.Errorf("failed to check existing target binding: %w", err)
+	}
+
+	if errors.Is(err, ErrReleaseBindingNotFound) {
+		// No existing binding, generate new name
+		targetBindingName = fmt.Sprintf("%s-%s", req.ComponentName, req.TargetEnvironment)
+	} else {
+		// Existing binding found, use its name
+		targetBindingName = existingTargetBinding.Name
+	}
+
+	var targetBinding *openchoreov1alpha1.ReleaseBinding
+
+	if existingTargetBinding == nil {
+		targetBinding = &openchoreov1alpha1.ReleaseBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      targetBindingName,
+				Namespace: req.OrgName,
+				Labels: map[string]string{
+					labels.LabelKeyProjectName:   req.ProjectName,
+					labels.LabelKeyComponentName: req.ComponentName,
+				},
+			},
+			Spec: openchoreov1alpha1.ReleaseBindingSpec{
+				Owner: openchoreov1alpha1.ReleaseBindingOwner{
+					ProjectName:   req.ProjectName,
+					ComponentName: req.ComponentName,
+				},
+				Environment: req.TargetEnvironment,
+			},
+		}
+	} else {
+		targetBinding = existingTargetBinding
+		targetBinding.Spec.ReleaseName = sourceBinding.Spec.ReleaseName
+	}
+
+	s.logger.Info("Target binding", "targetBinding", targetBinding)
+
+	if existingTargetBinding == nil {
+		// Create new binding
+		if err := s.k8sClient.Create(ctx, targetBinding); err != nil {
+			return fmt.Errorf("failed to create target release binding: %w", err)
+		}
+		s.logger.Debug("Created new ReleaseBinding", "name", targetBindingName, "namespace", req.OrgName, "environment", req.TargetEnvironment)
+	} else {
+		// Update existing binding
+		if err := s.k8sClient.Update(ctx, targetBinding); err != nil {
+			return fmt.Errorf("failed to update target release binding: %w", err)
+		}
+		s.logger.Debug("Updated existing ReleaseBinding", "name", targetBindingName, "namespace", req.OrgName, "environment", req.TargetEnvironment)
+	}
+
+	return nil
 }
 
 // createOrUpdateTargetBinding creates or updates the binding in the target environment

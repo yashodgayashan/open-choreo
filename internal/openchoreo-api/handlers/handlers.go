@@ -91,6 +91,16 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET "+v1+"/orgs/{orgName}/projects/{projectName}/components/{componentName}/bindings", h.GetComponentBinding)
 	mux.HandleFunc("PATCH "+v1+"/orgs/{orgName}/projects/{projectName}/components/{componentName}/bindings/{bindingName}", h.UpdateComponentBinding)
 
+	mux.HandleFunc("GET "+v1+"/orgs/{orgName}/projects/{projectName}/components/{componentName}/component-releases", h.ListComponentReleases)
+	mux.HandleFunc("POST "+v1+"/orgs/{orgName}/projects/{projectName}/components/{componentName}/component-releases", h.CreateComponentRelease)
+	mux.HandleFunc("GET "+v1+"/orgs/{orgName}/projects/{projectName}/components/{componentName}/component-releases/{releaseName}", h.GetComponentRelease)
+
+	mux.HandleFunc("GET "+v1+"/orgs/{orgName}/projects/{projectName}/components/{componentName}/release-bindings", h.ListReleaseBindings)
+	mux.HandleFunc("PATCH "+v1+"/orgs/{orgName}/projects/{projectName}/components/{componentName}/release-bindings/{bindingName}", h.PatchReleaseBinding)
+
+	// Deployment endpoint
+	mux.HandleFunc("POST "+v1+"/orgs/{orgName}/projects/{projectName}/components/{componentName}/deploy", h.DeployRelease)
+
 	// This is the promotion endpoint...
 	mux.HandleFunc("POST "+v1+"/orgs/{orgName}/projects/{projectName}/components/{componentName}/promote", h.PromoteComponent)
 
