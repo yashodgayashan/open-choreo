@@ -15,16 +15,9 @@ type BuildPlaneSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	// Agent specifies the configuration for agent-based communication with the downstream cluster
-	// When enabled, the control plane communicates with the downstream cluster through a WebSocket agent
-	// instead of direct Kubernetes API access
-	// +optional
-	Agent *AgentConfig `json:"agent,omitempty"`
-
-	// KubernetesCluster defines the Kubernetes cluster where build workloads (e.g., Argo Workflows) will be executed.
-	// This field is optional when Agent.Enabled is true
-	// +optional
-	KubernetesCluster *KubernetesClusterSpec `json:"kubernetesCluster,omitempty"`
+	// ClusterAgent specifies the configuration for cluster agent-based communication with the downstream cluster
+	// The control plane communicates with the downstream cluster through a WebSocket cluster agent
+	ClusterAgent ClusterAgentConfig `json:"clusterAgent"`
 
 	// ObservabilityPlaneRef specifies the name of the ObservabilityPlane for this BuildPlane.
 	// +optional

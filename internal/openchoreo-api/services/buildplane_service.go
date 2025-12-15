@@ -20,14 +20,16 @@ import (
 type BuildPlaneService struct {
 	k8sClient   client.Client
 	bpClientMgr *kubernetesClient.KubeMultiClientManager
+	gatewayURL  string
 	logger      *slog.Logger
 }
 
 // NewBuildPlaneService creates a new build plane service
-func NewBuildPlaneService(k8sClient client.Client, bpClientMgr *kubernetesClient.KubeMultiClientManager, logger *slog.Logger) *BuildPlaneService {
+func NewBuildPlaneService(k8sClient client.Client, bpClientMgr *kubernetesClient.KubeMultiClientManager, gatewayURL string, logger *slog.Logger) *BuildPlaneService {
 	return &BuildPlaneService{
 		k8sClient:   k8sClient,
 		bpClientMgr: bpClientMgr,
+		gatewayURL:  gatewayURL,
 		logger:      logger,
 	}
 }
@@ -58,6 +60,7 @@ func (s *BuildPlaneService) GetBuildPlane(ctx context.Context, orgName string) (
 }
 
 // GetBuildPlaneClient creates and returns a Kubernetes client for the build plane cluster
+// Uses cluster agent mode via HTTP proxy through the cluster gateway
 func (s *BuildPlaneService) GetBuildPlaneClient(ctx context.Context, orgName string) (client.Client, error) {
 	s.logger.Debug("Getting build plane client", "org", orgName)
 
@@ -67,23 +70,18 @@ func (s *BuildPlaneService) GetBuildPlaneClient(ctx context.Context, orgName str
 		return nil, fmt.Errorf("failed to get build plane: %w", err)
 	}
 
-	if buildPlane.Spec.KubernetesCluster == nil {
-		s.logger.Error("KubernetesCluster configuration is required for BuildPlane", "org", orgName, "buildPlane", buildPlane.Name)
-		return nil, fmt.Errorf("kubernetesCluster configuration is required for BuildPlane")
-	}
-
-	buildPlaneClient, err := kubernetesClient.GetK8sClient(
+	// Use cluster agent mode to get client
+	buildPlaneClient, err := kubernetesClient.GetK8sClientFromBuildPlane(
 		s.bpClientMgr,
-		orgName,
-		buildPlane.Name,
-		*buildPlane.Spec.KubernetesCluster,
+		buildPlane,
+		s.gatewayURL,
 	)
 	if err != nil {
-		s.logger.Error("Failed to create build plane client", "error", err, "org", orgName)
+		s.logger.Error("Failed to create build plane client via cluster agent", "error", err, "org", orgName)
 		return nil, fmt.Errorf("failed to create build plane client: %w", err)
 	}
 
-	s.logger.Debug("Created build plane client", "org", orgName, "cluster", buildPlane.Name)
+	s.logger.Debug("Created build plane client via cluster agent", "org", orgName, "buildPlane", buildPlane.Name)
 	return buildPlaneClient, nil
 }
 
@@ -121,8 +119,7 @@ func (s *BuildPlaneService) ListBuildPlanes(ctx context.Context, orgName string)
 			Namespace:             buildPlane.Namespace,
 			DisplayName:           displayName,
 			Description:           description,
-			KubernetesClusterName: buildPlane.Name,
-			APIServerURL:          buildPlane.Spec.KubernetesCluster.Server,
+			ClusterAgentEnabled:   true, // Always enabled in cluster agent mode
 			ObservabilityPlaneRef: observabilityPlaneRef,
 			CreatedAt:             buildPlane.CreationTimestamp.Time,
 			Status:                status,
