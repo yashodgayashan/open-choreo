@@ -210,4 +210,25 @@ resources:
   kind: ObservabilityAlertRule
   path: github.com/openchoreo/openchoreo/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+  controller: true
+  domain: openchoreo.dev
+  kind: ClusterDataPlane
+  path: github.com/openchoreo/openchoreo/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+  controller: true
+  domain: openchoreo.dev
+  kind: ClusterBuildPlane
+  path: github.com/openchoreo/openchoreo/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+  controller: true
+  domain: openchoreo.dev
+  kind: ClusterObservabilityPlane
+  path: github.com/openchoreo/openchoreo/api/v1alpha1
+  version: v1alpha1
 version: "3"

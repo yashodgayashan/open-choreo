@@ -74,6 +74,15 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the openchoreo itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+  - clusterobservabilityplane_admin_role.yaml
+  - clusterobservabilityplane_editor_role.yaml
+  - clusterobservabilityplane_viewer_role.yaml
+  - clusterbuildplane_admin_role.yaml
+  - clusterbuildplane_editor_role.yaml
+  - clusterbuildplane_viewer_role.yaml
+  - clusterdataplane_admin_role.yaml
+  - clusterdataplane_editor_role.yaml
+  - clusterdataplane_viewer_role.yaml
   - componentworkflowrun_admin_role.yaml
   - componentworkflowrun_editor_role.yaml
   - componentworkflowrun_viewer_role.yaml
@@ -95,3 +104,5 @@ resources:
   - observabilityalertrule_admin_role.yaml
   - observabilityalertrule_editor_role.yaml
   - observabilityalertrule_viewer_role.yaml
+
+
