@@ -18,6 +18,8 @@ import (
 	"github.com/openchoreo/openchoreo/internal/cluster-agent/messaging"
 )
 
+const wildcardCR = "*"
+
 // AgentConnection represents an active agent connection
 // Multiple agent replicas for the same plane can share the same PlaneIdentifier for HA
 // One agent per physical plane handles multiple CRs with the same planeID
@@ -38,6 +40,10 @@ type AgentConnection struct {
 func (ac *AgentConnection) IsValidForCR(crKey string) bool {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
+
+	if slices.Contains(ac.ValidCRs, wildcardCR) {
+		return true
+	}
 
 	return slices.Contains(ac.ValidCRs, crKey)
 }
@@ -102,6 +108,10 @@ func (ac *AgentConnection) removeValidCRUnsafe(crKey string) {
 func (ac *AgentConnection) UpdateCRValidity(crKey string, certPool *x509.CertPool) (granted bool, revoked bool, err error) {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
+
+	if slices.Contains(ac.ValidCRs, wildcardCR) || ac.clientCert == nil {
+		return false, false, nil
+	}
 
 	wasValid := slices.Contains(ac.ValidCRs, crKey)
 
@@ -507,7 +517,7 @@ func (cm *ConnectionManager) GetCRAuthorizationStatus(planeType, planeID, namesp
 		conn.mu.Lock()
 		isAuthorized := false
 		for _, validCR := range conn.ValidCRs {
-			if validCR == crIdentifier {
+			if validCR == wildcardCR || validCR == crIdentifier {
 				isAuthorized = true
 				break
 			}
